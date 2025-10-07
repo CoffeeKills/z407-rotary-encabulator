@@ -1,13 +1,13 @@
 use anyhow::Result;
 use egui::{CentralPanel, Color32, Context, Slider};
 use eframe::egui;
-use bluest::{Adapter, AdvertisingDevice, Characteristic, Device, Service, Uuid};
+use bluest::{Adapter, Device, Uuid};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tokio::time::sleep;
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Z407State {
     connected: bool,
     volume: f32,
@@ -63,15 +63,17 @@ impl Z407PuckApp {
         }
         drop(s);
 
-        let adapter = Adapter::default().await.map_err(|_| anyhow::anyhow!("No adapter"))?;
+        let Some(mut adapter) = Adapter::default().await else {
+            return Err(anyhow::anyhow!("No adapter"));
+        };
         adapter.wait_available().await?;
 
         let target_name = "Logitech Z407".to_string();
-        let mut scan = adapter.scan(&[]).await?;
+        let mut scan_handle = adapter.scan(&[]).await?;
         let mut device_opt: Option<Device> = None;
 
         // Scan for device
-        while let Some(adv_device) = scan.next().await {
+        while let Some(adv_device) = scan_handle.next().await {
             if let Ok(name) = adv_device.device.name().await {
                 if name.as_deref() == Some(&target_name) {
                     device_opt = Some(adv_device.device);
@@ -80,16 +82,16 @@ impl Z407PuckApp {
             }
         }
 
-        let Some(device) = device_opt else {
+        let Some(mut device) = device_opt else {
             eprintln!("Z407 not found");
             return Ok(());
         };
 
-        adapter.connect_device(&device).await?;
+        adapter.connect_device(&mut device).await?;
 
-        let service_uuid = Uuid::from_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
-        let cmd_uuid = Uuid::from_str("c2e758b9-0e78-41e0-b0cb-98a593193fc5")?;
-        let resp_uuid = Uuid::from_str("b84ac9c6-29c5-46d4-bba1-9d534784330f")?;
+        let service_uuid = Uuid::parse_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
+        let cmd_uuid = Uuid::parse_str("c2e758b9-0e78-41e0-b0cb-98a593193fc5")?;
+        let resp_uuid = Uuid::parse_str("b84ac9c6-29c5-46d4-bba1-9d534784330f")?;
 
         let services = device.services().await?;
         let service = services
@@ -97,15 +99,26 @@ impl Z407PuckApp {
             .find(|s| s.uuid() == service_uuid)
             .ok_or(anyhow::anyhow!("Service not found"))?;
 
-        let cmd_char = service.characteristic(&cmd_uuid).await?.ok_or(anyhow::anyhow!("Cmd char not found"))?;
-        let resp_char = service.characteristic(&resp_uuid).await?.ok_or(anyhow::anyhow!("Resp char not found"))?;
+        let chars = service.characteristics().await?;
+        let cmd_char = chars
+            .iter()
+            .find(|c| c.uuid() == cmd_uuid)
+            .cloned()
+            .ok_or(anyhow::anyhow!("Cmd char not found"))?;
+        let resp_char = chars
+            .iter()
+            .find(|c| c.uuid() == resp_uuid)
+            .cloned()
+            .ok_or(anyhow::anyhow!("Resp char not found"))?;
 
         // Enable notifications
         let mut notifs = resp_char.notify().await?;
         let resp_tx_clone = resp_tx.clone();
         tokio::spawn(async move {
             while let Some(data) = notifs.next().await {
-                let _ = resp_tx_clone.send(hex::encode(data));
+                if let Ok(data) = data {
+                    let _ = resp_tx_clone.send(hex::encode(data));
+                }
             }
         });
 
@@ -122,9 +135,8 @@ impl Z407PuckApp {
         drop(s);
 
         // Command loop
-        drop(adapter); // Keep connection alive via device
         loop {
-            if let Ok(cmd) = cmd_rx.recv() {
+            if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
                 let _ = cmd_char.write(&cmd).await;
             }
         }
@@ -317,10 +329,8 @@ impl eframe::App for Z407PuckApp {
 fn main() -> Result<(), eframe::Error> {
     env_logger::init();
     let options = eframe::NativeOptions {
-        viewport: Some(
-            eframe::egui::ViewportBuilder::default()
-                .with_inner_size([350.0, 300.0].into()),
-        ),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([350.0, 300.0].into()),
         ..Default::default()
     };
     eframe::run_native(
