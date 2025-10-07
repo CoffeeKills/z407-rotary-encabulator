@@ -1,6 +1,6 @@
 use anyhow::Result;
 use eframe::egui;
-use bluest::{Adapter, Device, Uuid};
+use bluest::{Adapter, Uuid}; // Removed unused 'Device' import
 use egui::{CentralPanel, Color32, Context, Slider, vec2};
 use futures_util::stream::StreamExt;
 use std::sync::{Arc, Mutex, mpsc};
@@ -51,7 +51,6 @@ impl Z407PuckApp {
         cmd_rx: mpsc::Receiver<Vec<u8>>,
         resp_tx: mpsc::Sender<String>,
     ) -> Result<()> {
-        // --- FIX: Define the Service UUID to scan for ---
         let service_uuid = Uuid::parse_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
         
         loop {
@@ -68,14 +67,15 @@ impl Z407PuckApp {
             adapter.wait_available().await?;
             println!("Adapter available");
 
-            // --- FIX: Scan specifically for the Service UUID ---
             println!("Starting scan for Z407 service UUID...");
             let mut scan = adapter.scan(&[service_uuid]).await?;
             
             println!("Waiting for device...");
             let device_opt = tokio::time::timeout(Duration::from_secs(10), scan.next()).await;
 
-            let Some(Ok(Some(adv_device))) = device_opt else {
+            // --- THIS IS THE FIX ---
+            // The pattern now correctly matches the type Result<Option<AdvertisingDevice>, Elapsed>
+            let Ok(Some(adv_device)) = device_opt else {
                 eprintln!("Z407 not found in scan. Resetting scan request.");
                 let mut s = state.lock().unwrap();
                 s.scan_requested = false;
