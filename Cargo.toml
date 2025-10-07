@@ -1,0 +1,12 @@
+[package]
+name = "z407-puck"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simplersble = "0.6"
+egui = "0.27"
+eframe = { version = "0.27", features = ["default"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1.3", features = ["v4", "serde"] }
+anyhow = "1.0"
