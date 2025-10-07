@@ -71,7 +71,11 @@ impl Z407PuckApp {
             eprintln!("No Bluetooth adapter found");
             return Err(anyhow::anyhow!("No adapter"));
         };
-        println!("Adapter ready: {:?}", adapter.address());
+
+        // FIX #1: adapter.address() is now an async function and must be awaited.
+        let adapter_addr = adapter.address().await?;
+        println!("Adapter ready: {:?}", adapter_addr);
+
 
         println!("Waiting for adapter to be available...");
         adapter.wait_available().await?;
@@ -90,9 +94,12 @@ impl Z407PuckApp {
                 println!("Scan timeout");
                 break;
             }
+            // FIX #2: The device address is retrieved correctly here, the error was for the adapter.
             let addr = adv_device.device.address();
             println!("Scanned device: addr={:?}", addr);
-            if let Some(name) = adv_device.device.name() {
+
+            // FIX #3: device.name() is also now an async function and must be awaited.
+            if let Ok(Some(name)) = adv_device.device.name().await {
                 println!("  Name: '{}'", name);
                 if name == target_name {
                     println!("  MATCH! Connecting to {:?}", addr);
@@ -142,16 +149,13 @@ impl Z407PuckApp {
 
         // Enable notifications
         let resp_tx_clone = resp_tx.clone();
-        let resp_char_clone = resp_char.clone();
         tokio::spawn(async move {
-            if let Ok(mut notifs) = resp_char_clone.notify().await {
+            if let Ok(mut notifs) = resp_char.notify().await {
                 println!("Notifications enabled");
                 while let Some(data) = notifs.next().await {
-                    if let Ok(data) = data {
-                        let hex = hex::encode(data);
-                        println!("Response: {}", hex);
-                        let _ = resp_tx_clone.send(hex);
-                    }
+                    let hex = hex::encode(data);
+                    println!("Response: {}", hex);
+                    let _ = resp_tx_clone.send(hex);
                 }
             } else {
                 eprintln!("Failed to enable notifications");
@@ -161,29 +165,38 @@ impl Z407PuckApp {
         // Handshake
         println!("Sending INITIATE (84 05)");
         cmd_char.write(&[0x84, 0x05]).await?;
-        sleep(Duration::from_millis(200)).await;  // Give time for response
+        sleep(Duration::from_millis(200)).await;
         println!("Sending ACKNOWLEDGE (84 00)");
         cmd_char.write(&[0x84, 0x00]).await?;
         sleep(Duration::from_millis(200)).await;
         println!("Handshake complete");
 
-        // Set connected
-        let mut s = state.lock().unwrap();
-        s.connected = true;
-        s.current_input = "Bluetooth".to_string();
-        drop(s);
+        {
+            let mut s = state.lock().unwrap();
+            s.connected = true;
+            s.current_input = "Bluetooth".to_string();
+        }
 
         println!("Entering command loop");
 
         // Command loop
         loop {
-            if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
+            if let Ok(cmd) = cmd_rx.try_recv() {
                 println!("Sending cmd: {:?}", cmd);
-                let _ = cmd_char.write(&cmd).await;
-            } else {
-                sleep(Duration::from_millis(100)).await;
+                if cmd_char.write(&cmd).await.is_err() {
+                    eprintln!("Failed to write command, device may have disconnected.");
+                    break;
+                }
             }
+            sleep(Duration::from_millis(50)).await;
         }
+
+        println!("Command loop exited.");
+        {
+            let mut s = state.lock().unwrap();
+            s.connected = false;
+        }
+        Ok(())
     }
 
     fn send_cmd(&self, cmd: &[u8]) {
@@ -193,25 +206,74 @@ impl Z407PuckApp {
         }
     }
 
-    fn test_ping(&mut self) {
-        self.send_cmd(&[0x85, 0x00]);  // UNKNOWN_1 - silent test
+    fn volume_up(&mut self) {
+        self.send_cmd(&[0x80, 0x02]);
     }
 
-    // ... (rest of methods unchanged: volume_up, etc.)
+    fn volume_down(&mut self) {
+        self.send_cmd(&[0x80, 0x03]);
+    }
+
+    fn bass_up(&mut self) {
+        self.send_cmd(&[0x80, 0x00]);
+    }
+
+    fn bass_down(&mut self) {
+        self.send_cmd(&[0x80, 0x01]);
+    }
+
+    fn play_pause(&mut self) {
+        self.send_cmd(&[0x80, 0x04]);
+    }
+
+    fn next_track(&mut self) {
+        self.send_cmd(&[0x80, 0x05]);
+    }
+
+    fn prev_track(&mut self) {
+        self.send_cmd(&[0x80, 0x06]);
+    }
+    
+    fn switch_bluetooth(&mut self) {
+        self.send_cmd(&[0x81, 0x01]);
+    }
+
+    fn switch_aux(&mut self) {
+        self.send_cmd(&[0x81, 0x02]);
+    }
+
+    fn switch_usb(&mut self) {
+        self.send_cmd(&[0x81, 0x03]);
+    }
+    
+    fn pairing(&mut self) {
+        self.send_cmd(&[0x82, 0x00]);
+    }
+    
+    fn factory_reset(&mut self) {
+        self.send_cmd(&[0x83, 0x00]);
+    }
 }
 
 impl eframe::App for Z407PuckApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Poll responses (for future parsing, e.g., confirm vol up)
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
+        // Poll responses
         if let Some(ref rx) = s.resp_rx {
             while let Ok(resp_hex) = rx.try_recv() {
-                println!("Response: {}", resp_hex);  // Already logged in spawn, but for UI sync
+                // Here you can parse responses and update the state
+                // For now, it's just logged in the BLE thread
+                match resp_hex.as_str() {
+                    "c101" => s.current_input = "Bluetooth".to_string(),
+                    "c102" => s.current_input = "AUX".to_string(),
+                    "c103" => s.current_input = "USB".to_string(),
+                    _ => {}
+                }
             }
         }
+        
         let connected = s.connected;
         let current_input = s.current_input.clone();
-        drop(s);
 
         CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -220,23 +282,75 @@ impl eframe::App for Z407PuckApp {
 
                 if !connected {
                     if ui.button("Scan & Connect").clicked() {
-                        let mut s = self.state.lock().unwrap();
                         s.scan_requested = true;
+                        // You might need to restart the BLE thread here if it has exited.
+                        // This implementation assumes the app is restarted.
                     }
                 } else {
-                    // ... (volume/bass/media/input buttons unchanged)
+                    // Volume slider
+                    ui.horizontal(|ui| {
+                        if ui.button("Vol -").clicked() { self.volume_down(); }
+                        ui.add(Slider::new(&mut s.volume, 0.0..=100.0).text("Volume"));
+                        if ui.button("Vol +").clicked() { self.volume_up(); }
+                    });
+
+                    // Bass slider
+                    ui.horizontal(|ui| {
+                        if ui.button("Bass -").clicked() { self.bass_down(); }
+                        ui.add(Slider::new(&mut s.bass, 0.0..=100.0).text("Bass"));
+                        if ui.button("Bass +").clicked() { self.bass_up(); }
+                    });
 
                     ui.add_space(5.0);
-                    // Test ping button
-                    if ui.button("Test Ping (Silent)").clicked() {
-                        self.test_ping();
-                    }
+                    ui.label(format!("Current Input: {}", current_input));
+
+                    // Media buttons
+                    ui.horizontal(|ui| {
+                        if ui.button("⏮️ Prev").clicked() { self.prev_track(); }
+                        if ui.button("⏸️ Play/Pause").clicked() { self.play_pause(); }
+                        if ui.button("⏭️ Next").clicked() { self.next_track(); }
+                    });
+
+                    // Input switches
+                    ui.horizontal(|ui| {
+                        if ui.button("BT").clicked() { self.switch_bluetooth(); }
+                        if ui.button("AUX").clicked() { self.switch_aux(); }
+                        if ui.button("USB").clicked() { self.switch_usb(); }
+                    });
+
+                    ui.add_space(5.0);
+                    // Extras
+                    ui.horizontal(|ui| {
+                        if ui.button("Pairing Mode").clicked() { self.pairing(); }
+                        if ui.button("Factory Reset").clicked() { self.factory_reset(); }
+                    });
                 }
 
-                // ... (status label unchanged)
+                ui.add_space(10.0);
+                let (color, text) = if connected {
+                    (Color32::GREEN, "Connected to Z407")
+                } else {
+                    (Color32::RED, "Disconnected - Click to Scan")
+                };
+                ui.colored_label(color, text);
             });
         });
+        
+        // Request a repaint to keep the UI responsive
+        ctx.request_repaint();
     }
 }
 
-// ... (main unchanged)
+fn main() -> Result<(), eframe::Error> {
+    env_logger::init(); // Initialize the logger
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(vec2(350.0, 400.0)), // Adjusted size for better layout
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Z407 Puck",
+        options,
+        Box::new(|cc| Box::new(Z407PuckApp::new(cc))),
+    )
+}
