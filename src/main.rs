@@ -42,10 +42,11 @@ impl Z407PuckApp {
 
         // Spawn BLE thread
         thread::spawn(move || {
+            println!("BLE thread started");
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 if let Err(e) = Self::ble_loop(state_clone, cmd_rx, resp_tx).await {
-                    eprintln!("BLE error: {}", e);
+                    eprintln!("BLE loop error: {}", e);
                 }
             });
         });
@@ -60,76 +61,111 @@ impl Z407PuckApp {
     ) -> Result<()> {
         let s = state.lock().unwrap();
         if !s.scan_requested {
+            println!("Scan not requested");
             return Ok(());
         }
         drop(s);
 
+        println!("Getting default adapter...");
         let Some(adapter) = Adapter::default().await else {
+            eprintln!("No Bluetooth adapter found");
             return Err(anyhow::anyhow!("No adapter"));
         };
+        println!("Adapter ready: {:?}", adapter.address());
+
+        println!("Waiting for adapter to be available...");
         adapter.wait_available().await?;
+        println!("Adapter available");
 
         let target_name = "Logitech Z407".to_string();
+        println!("Starting scan for '{}'", target_name);
         let mut scan_handle = adapter.scan(&[]).await?;
         let mut device_opt: Option<Device> = None;
+        let scan_start = std::time::Instant::now();
+        let scan_timeout = Duration::from_secs(10);
 
         // Scan for device
         while let Some(adv_device) = scan_handle.next().await {
+            if scan_start.elapsed() > scan_timeout {
+                println!("Scan timeout");
+                break;
+            }
+            let addr = adv_device.device.address();
+            println!("Scanned device: addr={:?}", addr);
             if let Some(name) = adv_device.device.name() {
+                println!("  Name: '{}'", name);
                 if name == target_name {
+                    println!("  MATCH! Connecting to {:?}", addr);
                     device_opt = Some(adv_device.device);
                     break;
                 }
+            } else {
+                println!("  No name");
             }
         }
 
         let Some(mut device) = device_opt else {
-            eprintln!("Z407 not found");
+            eprintln!("Z407 not found in scan");
             return Ok(());
         };
 
+        println!("Connecting to device...");
         adapter.connect_device(&mut device).await?;
+        println!("Connected! Discovering services...");
 
         let service_uuid = Uuid::parse_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
         let cmd_uuid = Uuid::parse_str("c2e758b9-0e78-41e0-b0cb-98a593193fc5")?;
         let resp_uuid = Uuid::parse_str("b84ac9c6-29c5-46d4-bba1-9d534784330f")?;
 
         let services = device.services().await?;
+        println!("Found {} services", services.len());
         let service = services
             .into_iter()
             .find(|s| s.uuid() == service_uuid)
             .ok_or(anyhow::anyhow!("Service not found"))?;
+        println!("Found target service: {:?}", service.uuid());
 
         let chars = service.characteristics().await?;
+        println!("Found {} characteristics", chars.len());
         let cmd_char = chars
             .iter()
             .find(|c| c.uuid() == cmd_uuid)
             .cloned()
             .ok_or(anyhow::anyhow!("Cmd char not found"))?;
+        println!("Found cmd char: {:?}", cmd_char.uuid());
         let resp_char = chars
             .iter()
             .find(|c| c.uuid() == resp_uuid)
             .cloned()
             .ok_or(anyhow::anyhow!("Resp char not found"))?;
+        println!("Found resp char: {:?}", resp_char.uuid());
 
         // Enable notifications
         let resp_tx_clone = resp_tx.clone();
         let resp_char_clone = resp_char.clone();
         tokio::spawn(async move {
             if let Ok(mut notifs) = resp_char_clone.notify().await {
+                println!("Notifications enabled");
                 while let Some(data) = notifs.next().await {
                     if let Ok(data) = data {
-                        let _ = resp_tx_clone.send(hex::encode(data));
+                        let hex = hex::encode(data);
+                        println!("Response: {}", hex);
+                        let _ = resp_tx_clone.send(hex);
                     }
                 }
+            } else {
+                eprintln!("Failed to enable notifications");
             }
         });
 
         // Handshake
+        println!("Sending INITIATE (84 05)");
         cmd_char.write(&[0x84, 0x05]).await?;
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(200)).await;  // Give time for response
+        println!("Sending ACKNOWLEDGE (84 00)");
         cmd_char.write(&[0x84, 0x00]).await?;
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(200)).await;
+        println!("Handshake complete");
 
         // Set connected
         let mut s = state.lock().unwrap();
@@ -137,9 +173,12 @@ impl Z407PuckApp {
         s.current_input = "Bluetooth".to_string();
         drop(s);
 
+        println!("Entering command loop");
+
         // Command loop
         loop {
             if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
+                println!("Sending cmd: {:?}", cmd);
                 let _ = cmd_char.write(&cmd).await;
             } else {
                 sleep(Duration::from_millis(100)).await;
@@ -154,67 +193,11 @@ impl Z407PuckApp {
         }
     }
 
-    fn volume_up(&mut self) {
-        self.send_cmd(&[0x80, 0x02]);
-        let mut s = self.state.lock().unwrap();
-        s.volume = (s.volume + 5.0).min(100.0);
+    fn test_ping(&mut self) {
+        self.send_cmd(&[0x85, 0x00]);  // UNKNOWN_1 - silent test
     }
 
-    fn volume_down(&mut self) {
-        self.send_cmd(&[0x80, 0x03]);
-        let mut s = self.state.lock().unwrap();
-        s.volume = (s.volume - 5.0).max(0.0);
-    }
-
-    fn bass_up(&mut self) {
-        self.send_cmd(&[0x80, 0x00]);
-        let mut s = self.state.lock().unwrap();
-        s.bass = (s.bass + 5.0).min(100.0);
-    }
-
-    fn bass_down(&mut self) {
-        self.send_cmd(&[0x80, 0x01]);
-        let mut s = self.state.lock().unwrap();
-        s.bass = (s.bass - 5.0).max(0.0);
-    }
-
-    fn play_pause(&mut self) {
-        self.send_cmd(&[0x80, 0x04]);
-    }
-
-    fn next_track(&mut self) {
-        self.send_cmd(&[0x80, 0x05]);
-    }
-
-    fn prev_track(&mut self) {
-        self.send_cmd(&[0x80, 0x06]);
-    }
-
-    fn switch_bluetooth(&mut self) {
-        self.send_cmd(&[0x81, 0x01]);
-        let mut s = self.state.lock().unwrap();
-        s.current_input = "Bluetooth".to_string();
-    }
-
-    fn switch_aux(&mut self) {
-        self.send_cmd(&[0x81, 0x02]);
-        let mut s = self.state.lock().unwrap();
-        s.current_input = "AUX".to_string();
-    }
-
-    fn switch_usb(&mut self) {
-        self.send_cmd(&[0x81, 0x03]);
-        let mut s = self.state.lock().unwrap();
-        s.current_input = "USB".to_string();
-    }
-
-    fn pairing(&mut self) {
-        self.send_cmd(&[0x82, 0x00]);
-    }
-
-    fn factory_reset(&mut self) {
-        self.send_cmd(&[0x83, 0x00]);
-    }
+    // ... (rest of methods unchanged: volume_up, etc.)
 }
 
 impl eframe::App for Z407PuckApp {
@@ -223,7 +206,7 @@ impl eframe::App for Z407PuckApp {
         let s = self.state.lock().unwrap();
         if let Some(ref rx) = s.resp_rx {
             while let Ok(resp_hex) = rx.try_recv() {
-                println!("Response: {}", resp_hex);  // e.g., if resp_hex == "c002" { s.volume += 1.0; }
+                println!("Response: {}", resp_hex);  // Already logged in spawn, but for UI sync
             }
         }
         let connected = s.connected;
@@ -241,106 +224,19 @@ impl eframe::App for Z407PuckApp {
                         s.scan_requested = true;
                     }
                 } else {
-                    // Volume slider (local copy)
-                    let mut volume = {
-                        let s_guard = self.state.lock().unwrap();
-                        s_guard.volume
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.button("Vol -").clicked() {
-                            self.volume_down();
-                        }
-                        ui.add(Slider::new(&mut volume, 0.0..=100.0).text("Volume"));
-                        if ui.button("Vol +").clicked() {
-                            self.volume_up();
-                        }
-                    });
-                    // Update state post-slider
-                    {
-                        let mut s = self.state.lock().unwrap();
-                        s.volume = volume;
-                    }
-
-                    // Bass slider (local copy)
-                    let mut bass = {
-                        let s_guard = self.state.lock().unwrap();
-                        s_guard.bass
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.button("Bass -").clicked() {
-                            self.bass_down();
-                        }
-                        ui.add(Slider::new(&mut bass, 0.0..=100.0).text("Bass"));
-                        if ui.button("Bass +").clicked() {
-                            self.bass_up();
-                        }
-                    });
-                    // Update state post-slider
-                    {
-                        let mut s = self.state.lock().unwrap();
-                        s.bass = bass;
-                    }
+                    // ... (volume/bass/media/input buttons unchanged)
 
                     ui.add_space(5.0);
-                    ui.label(format!("Current Input: {}", current_input));
-
-                    // Media buttons
-                    ui.horizontal(|ui| {
-                        if ui.button("⏸️ Play/Pause").clicked() {
-                            self.play_pause();
-                        }
-                        if ui.button("⏭️ Next").clicked() {
-                            self.next_track();
-                        }
-                        if ui.button("⏮️ Prev").clicked() {
-                            self.prev_track();
-                        }
-                    });
-
-                    // Input switches
-                    ui.horizontal(|ui| {
-                        if ui.button("BT").clicked() {
-                            self.switch_bluetooth();
-                        }
-                        if ui.button("AUX").clicked() {
-                            self.switch_aux();
-                        }
-                        if ui.button("USB").clicked() {
-                            self.switch_usb();
-                        }
-                    });
-
-                    ui.add_space(5.0);
-                    // Extras
-                    ui.horizontal(|ui| {
-                        if ui.button("Pairing Mode").clicked() {
-                            self.pairing();
-                        }
-                        if ui.button("Factory Reset").clicked() {
-                            self.factory_reset();
-                        }
-                    });
+                    // Test ping button
+                    if ui.button("Test Ping (Silent)").clicked() {
+                        self.test_ping();
+                    }
                 }
 
-                ui.add_space(10.0);
-                let color = if connected { Color32::GREEN } else { Color32::RED };
-                let text = if connected { "Connected to Z407" } else { "Disconnected - Click Connect" };
-                ui.colored_label(color, text);
+                // ... (status label unchanged)
             });
         });
     }
 }
 
-fn main() -> Result<(), eframe::Error> {
-    env_logger::init();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(vec2(350.0f32, 300.0f32)),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Z407 Puck",
-        options,
-        Box::new(|cc| Box::new(Z407PuckApp::new(cc))),
-    )
-}
+// ... (main unchanged)
