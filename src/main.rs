@@ -33,7 +33,6 @@ impl Z407PuckApp {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Vec<u8>>();
         let (resp_tx, resp_rx) = mpsc::channel::<String>();
 
-        // Spawn BLE thread
         thread::spawn(move || {
             println!("BLE thread started");
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -52,83 +51,58 @@ impl Z407PuckApp {
         cmd_rx: mpsc::Receiver<Vec<u8>>,
         resp_tx: mpsc::Sender<String>,
     ) -> Result<()> {
+        // --- FIX: Define the Service UUID to scan for ---
+        let service_uuid = Uuid::parse_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
+        
         loop {
             {
                 let s = state.lock().unwrap();
                 if !s.scan_requested {
-                    // Sleep and check again
                     sleep(Duration::from_millis(200)).await;
                     continue;
                 }
-            } // Drop lock
+            }
 
             println!("Scan requested. Getting default adapter...");
-            let Some(adapter) = Adapter::default().await else {
-                eprintln!("No Bluetooth adapter found");
-                return Err(anyhow::anyhow!("No adapter"));
-            };
-
+            let adapter = Adapter::default().await.ok_or(anyhow::anyhow!("No Bluetooth adapter found"))?;
             adapter.wait_available().await?;
             println!("Adapter available");
 
-            let target_name = "Logitech Z407".to_string();
-            println!("Starting scan for '{}'", target_name);
-            let mut scan_handle = adapter.scan(&[]).await?;
-            let mut device_opt: Option<Device> = None;
-            let scan_start = std::time::Instant::now();
-            let scan_timeout = Duration::from_secs(10);
+            // --- FIX: Scan specifically for the Service UUID ---
+            println!("Starting scan for Z407 service UUID...");
+            let mut scan = adapter.scan(&[service_uuid]).await?;
+            
+            println!("Waiting for device...");
+            let device_opt = tokio::time::timeout(Duration::from_secs(10), scan.next()).await;
 
-            // Scan for device
-            while let Some(adv_device) = scan_handle.next().await {
-                if scan_start.elapsed() > scan_timeout {
-                    println!("Scan timeout");
-                    break;
-                }
-                
-                // --- THIS IS THE FIX ---
-                // Removed the `?` which caused the compile errors.
-                // We simply ignore devices that don't have a name.
-                if let Some(name) = adv_device.device.name() {
-                    println!("Scanned device: {}", name);
-                    if name == target_name {
-                        println!("MATCH! Connecting...");
-                        device_opt = Some(adv_device.device);
-                        break;
-                    }
-                }
-            }
-
-            let Some(mut device) = device_opt else {
+            let Some(Ok(Some(adv_device))) = device_opt else {
                 eprintln!("Z407 not found in scan. Resetting scan request.");
-                 let mut s = state.lock().unwrap();
-                 s.scan_requested = false;
+                let mut s = state.lock().unwrap();
+                s.scan_requested = false;
                 continue;
             };
 
-            println!("Connecting to device...");
+            let mut device = adv_device.device;
+            println!("Found device: {:?}, connecting...", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+
             adapter.connect_device(&mut device).await?;
             println!("Connected! Discovering services...");
 
-            let service_uuid = Uuid::parse_str("0000fdc2-0000-1000-8000-00805f9b34fb")?;
             let cmd_uuid = Uuid::parse_str("c2e758b9-0e78-41e0-b0cb-98a593193fc5")?;
             let resp_uuid = Uuid::parse_str("b84ac9c6-29c5-46d4-bba1-9d534784330f")?;
 
-            let services = device.services().await?;
-            let service = services
+            let service = device.services().await?
                 .into_iter()
                 .find(|s| s.uuid() == service_uuid)
                 .ok_or(anyhow::anyhow!("Service not found"))?;
 
-            let chars = service.characteristics().await?;
-            let cmd_char = chars
-                .iter()
+            let cmd_char = service.characteristics().await?
+                .into_iter()
                 .find(|c| c.uuid() == cmd_uuid)
-                .cloned()
                 .ok_or(anyhow::anyhow!("Cmd char not found"))?;
-            let resp_char = chars
-                .iter()
+            let resp_char = service.characteristics().await?
+                .into_iter()
                 .find(|c| c.uuid() == resp_uuid)
-                .cloned()
                 .ok_or(anyhow::anyhow!("Resp char not found"))?;
 
             let resp_tx_clone = resp_tx.clone();
@@ -138,34 +112,31 @@ impl Z407PuckApp {
                     while let Some(data_res) = notifs.next().await {
                         if let Ok(data) = data_res {
                             let hex = hex::encode(data);
-                            println!("Response: {}", hex);
                             let _ = resp_tx_clone.send(hex);
                         }
                     }
-                } else {
-                    eprintln!("Failed to enable notifications");
                 }
             });
 
-            // Handshake
             cmd_char.write(&[0x84, 0x05]).await?;
             sleep(Duration::from_millis(200)).await;
             cmd_char.write(&[0x84, 0x00]).await?;
-            sleep(Duration::from_millis(200)).await;
             println!("Handshake complete");
 
             {
                 let mut s = state.lock().unwrap();
                 s.connected = true;
-                s.scan_requested = false; // Reset scan request
-                s.current_input = "Bluetooth".to_string();
+                s.scan_requested = false;
             }
 
-            // Command loop
             loop {
+                if !device.is_connected().await? {
+                    println!("Device disconnected.");
+                    break;
+                }
                 if let Ok(cmd) = cmd_rx.try_recv() {
                     if cmd_char.write(&cmd).await.is_err() {
-                        eprintln!("Failed to write command, device disconnected.");
+                        eprintln!("Failed to write command.");
                         break;
                     }
                 }
@@ -180,9 +151,7 @@ impl Z407PuckApp {
         }
     }
     
-    fn send_cmd(&self, cmd: &[u8]) {
-        let _ = self.cmd_tx.send(cmd.to_vec());
-    }
+    fn send_cmd(&self, cmd: &[u8]) { let _ = self.cmd_tx.send(cmd.to_vec()); }
     fn volume_up(&self) { self.send_cmd(&[0x80, 0x02]); }
     fn volume_down(&self) { self.send_cmd(&[0x80, 0x03]); }
     fn bass_up(&self) { self.send_cmd(&[0x80, 0x00]); }
@@ -203,7 +172,7 @@ impl eframe::App for Z407PuckApp {
         if !responses.is_empty() {
             let mut s = self.state.lock().unwrap();
             for resp_hex in responses {
-                match resp_hex.as_str() {
+                 match resp_hex.as_str() {
                     "c101" => s.current_input = "Bluetooth".to_string(),
                     "c102" => s.current_input = "AUX".to_string(),
                     "c103" => s.current_input = "USB".to_string(),
