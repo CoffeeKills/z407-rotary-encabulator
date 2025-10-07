@@ -75,7 +75,7 @@ impl Z407PuckApp {
 
         // Scan for device
         while let Some(adv_device) = scan_handle.next().await {
-            if let Ok(name) = adv_device.device.name().await {
+            if let Ok(name) = adv_device.device.name() {
                 if name.as_deref() == Some(&target_name) {
                     device_opt = Some(adv_device.device);
                     break;
