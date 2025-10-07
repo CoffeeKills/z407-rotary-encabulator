@@ -58,13 +58,13 @@ impl Z407PuckApp {
         cmd_rx: mpsc::Receiver<Vec<u8>>,
         resp_tx: mpsc::Sender<String>,
     ) -> Result<()> {
-        let mut s = state.lock().unwrap();
+        let s = state.lock().unwrap();
         if !s.scan_requested {
             return Ok(());
         }
         drop(s);
 
-        let Some(mut adapter) = Adapter::default().await else {
+        let Some(adapter) = Adapter::default().await else {
             return Err(anyhow::anyhow!("No adapter"));
         };
         adapter.wait_available().await?;
@@ -113,12 +113,14 @@ impl Z407PuckApp {
             .ok_or(anyhow::anyhow!("Resp char not found"))?;
 
         // Enable notifications
-        let mut notifs = resp_char.notify().await?;
         let resp_tx_clone = resp_tx.clone();
+        let resp_char_clone = resp_char.clone();
         tokio::spawn(async move {
-            while let Some(data) = notifs.next().await {
-                if let Ok(data) = data {
-                    let _ = resp_tx_clone.send(hex::encode(data));
+            if let Ok(mut notifs) = resp_char_clone.notify().await {
+                while let Some(data) = notifs.next().await {
+                    if let Ok(data) = data {
+                        let _ = resp_tx_clone.send(hex::encode(data));
+                    }
                 }
             }
         });
