@@ -1,11 +1,12 @@
 use anyhow::Result;
-use egui::{CentralPanel, Color32, Context, Slider};
+use egui::{CentralPanel, Color32, Context, Slider, vec2};
 use eframe::egui;
 use bluest::{Adapter, Device, Uuid};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 use tokio::time::sleep;
+use futures_util::stream::StreamExt;
 
 #[derive(Default)]
 struct Z407State {
@@ -138,6 +139,8 @@ impl Z407PuckApp {
         loop {
             if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
                 let _ = cmd_char.write(&cmd).await;
+            } else {
+                sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -215,7 +218,7 @@ impl Z407PuckApp {
 impl eframe::App for Z407PuckApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Poll responses (for future parsing, e.g., confirm vol up)
-        let mut s = self.state.lock().unwrap();
+        let s = self.state.lock().unwrap();
         if let Some(ref rx) = s.resp_rx {
             while let Ok(resp_hex) = rx.try_recv() {
                 println!("Response: {}", resp_hex);  // e.g., if resp_hex == "c002" { s.volume += 1.0; }
@@ -330,7 +333,7 @@ fn main() -> Result<(), eframe::Error> {
     env_logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([350.0, 300.0].into()),
+            .with_inner_size(vec2(350.0f32, 300.0f32)),
         ..Default::default()
     };
     eframe::run_native(
