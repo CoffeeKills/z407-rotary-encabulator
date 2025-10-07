@@ -85,8 +85,10 @@ impl Z407PuckApp {
                     break;
                 }
                 
-                // FIX: No .await on .name() and use it directly
-                if let Some(name) = adv_device.device.name()? {
+                // --- THIS IS THE FIX ---
+                // Removed the `?` which caused the compile errors.
+                // We simply ignore devices that don't have a name.
+                if let Some(name) = adv_device.device.name() {
                     println!("Scanned device: {}", name);
                     if name == target_name {
                         println!("MATCH! Connecting...");
@@ -134,7 +136,6 @@ impl Z407PuckApp {
                 if let Ok(mut notifs) = resp_char.notify().await {
                     println!("Notifications enabled");
                     while let Some(data_res) = notifs.next().await {
-                        // FIX: handle the Result from the stream
                         if let Ok(data) = data_res {
                             let hex = hex::encode(data);
                             println!("Response: {}", hex);
@@ -198,9 +199,6 @@ impl Z407PuckApp {
 
 impl eframe::App for Z407PuckApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // --- FIX for borrow checker errors E0502 & E0500 ---
-
-        // Part 1: Handle incoming responses without holding the lock
         let responses: Vec<String> = self.resp_rx.try_iter().collect();
         if !responses.is_empty() {
             let mut s = self.state.lock().unwrap();
@@ -214,10 +212,8 @@ impl eframe::App for Z407PuckApp {
             }
         }
 
-        // Part 2: Get a clone of the state for the UI to display
         let mut current_state = self.state.lock().unwrap().clone();
 
-        // Part 3: Draw the UI
         CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.heading("Z407 Digital Puck");
@@ -225,7 +221,6 @@ impl eframe::App for Z407PuckApp {
 
                 if !current_state.connected {
                     if ui.button("Scan & Connect").clicked() {
-                        // This will be picked up by the BLE loop
                         self.state.lock().unwrap().scan_requested = true;
                     }
                 } else {
@@ -268,10 +263,8 @@ impl eframe::App for Z407PuckApp {
             });
         });
 
-        // Part 4: Write back any changes from the UI (like sliders) to the shared state
         {
             let mut s = self.state.lock().unwrap();
-            // In a real app, you'd check if the value changed before sending a command
             s.volume = current_state.volume;
             s.bass = current_state.bass;
         }
