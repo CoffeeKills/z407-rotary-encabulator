@@ -1,6 +1,6 @@
 use anyhow::Result;
 use eframe::egui;
-use bluest::{Adapter, Uuid}; // Removed unused 'Device' import
+use bluest::{Adapter, Uuid};
 use egui::{CentralPanel, Color32, Context, Slider, vec2};
 use futures_util::stream::StreamExt;
 use std::sync::{Arc, Mutex, mpsc};
@@ -73,8 +73,6 @@ impl Z407PuckApp {
             println!("Waiting for device...");
             let device_opt = tokio::time::timeout(Duration::from_secs(10), scan.next()).await;
 
-            // --- THIS IS THE FIX ---
-            // The pattern now correctly matches the type Result<Option<AdvertisingDevice>, Elapsed>
             let Ok(Some(adv_device)) = device_opt else {
                 eprintln!("Z407 not found in scan. Resetting scan request.");
                 let mut s = state.lock().unwrap();
@@ -83,7 +81,13 @@ impl Z407PuckApp {
             };
 
             let mut device = adv_device.device;
-            println!("Found device: {:?}, connecting...", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+            
+            // --- FIX #1: Use a match statement for clarity and correctness ---
+            let device_name = match device.name() {
+                Ok(name) => name,
+                Err(_) => "Unknown".to_string(),
+            };
+            println!("Found device: {}, connecting...", device_name);
 
             adapter.connect_device(&mut device).await?;
             println!("Connected! Discovering services...");
@@ -130,7 +134,8 @@ impl Z407PuckApp {
             }
 
             loop {
-                if !device.is_connected().await? {
+                // --- FIX #2: Removed .await from is_connected() ---
+                if !device.is_connected()? {
                     println!("Device disconnected.");
                     break;
                 }
